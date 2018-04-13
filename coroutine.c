@@ -135,7 +135,7 @@ mainfunc(uint32_t low32, uint32_t hi32) {
 	S->running = -1;
 }
 
-
+#ifdef _MSC_VER
 static void
 __stdcall win_mainfunc(void * arg)
 {
@@ -144,10 +144,9 @@ __stdcall win_mainfunc(void * arg)
 
 	mainfunc((uint32_t)ptr, (uint32_t)(ptr >> 32));
 
-#ifdef _MSC_VER
 	SwitchToFiber(S->main);
-#endif
 }
+#endif
 
 void 
 coroutine_resume(struct schedule * S, int id) {
