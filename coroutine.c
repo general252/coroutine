@@ -6,7 +6,9 @@
 #include <string.h>
 #include <stdint.h>
 
-#if __APPLE__ && __MACH__
+#if defined(_MSC_VER)
+#include <windows.h>
+#elif __APPLE__ && __MACH__
 	#include <sys/ucontext.h>
 #else 
 	#include <ucontext.h>
@@ -19,7 +21,11 @@ struct coroutine;
 
 struct schedule {
 	char stack[STACK_SIZE];
+#ifdef _MSC_VER
+	void* main;
+#else
 	ucontext_t main;
+#endif // _MSC_VER
 	int nco;
 	int cap;
 	int running;
@@ -29,7 +35,11 @@ struct schedule {
 struct coroutine {
 	coroutine_func func;
 	void *ud;
+#ifdef _MSC_VER
+	void* ctx;
+#else
 	ucontext_t ctx;
+#endif
 	struct schedule * sch;
 	ptrdiff_t cap;
 	ptrdiff_t size;
@@ -39,7 +49,7 @@ struct coroutine {
 
 struct coroutine * 
 _co_new(struct schedule *S , coroutine_func func, void *ud) {
-	struct coroutine * co = malloc(sizeof(*co));
+	struct coroutine * co = (struct coroutine *)malloc(sizeof(*co));
 	co->func = func;
 	co->ud = ud;
 	co->sch = S;
@@ -58,12 +68,17 @@ _co_delete(struct coroutine *co) {
 
 struct schedule * 
 coroutine_open(void) {
-	struct schedule *S = malloc(sizeof(*S));
+	struct schedule *S = (struct schedule *)malloc(sizeof(*S));
 	S->nco = 0;
 	S->cap = DEFAULT_COROUTINE;
 	S->running = -1;
-	S->co = malloc(sizeof(struct coroutine *) * S->cap);
+	S->co = (struct coroutine **)malloc(sizeof(struct coroutine *) * S->cap);
 	memset(S->co, 0, sizeof(struct coroutine *) * S->cap);
+
+#ifdef _MSC_VER
+	S->main = ConvertThreadToFiber(NULL);
+#endif // _MSC_VER
+
 	return S;
 }
 
@@ -86,7 +101,7 @@ coroutine_new(struct schedule *S, coroutine_func func, void *ud) {
 	struct coroutine *co = _co_new(S, func , ud);
 	if (S->nco >= S->cap) {
 		int id = S->cap;
-		S->co = realloc(S->co, S->cap * 2 * sizeof(struct coroutine *));
+		S->co = (struct coroutine **)realloc(S->co, S->cap * 2 * sizeof(struct coroutine *));
 		memset(S->co + S->cap , 0 , sizeof(struct coroutine *) * S->cap);
 		S->co[S->cap] = co;
 		S->cap *= 2;
@@ -120,6 +135,20 @@ mainfunc(uint32_t low32, uint32_t hi32) {
 	S->running = -1;
 }
 
+
+static void
+__stdcall win_mainfunc(void * arg)
+{
+	struct schedule *S = (struct schedule *)arg;
+	uintptr_t ptr = (uintptr_t)S;
+
+	mainfunc((uint32_t)ptr, (uint32_t)(ptr >> 32));
+
+#ifdef _MSC_VER
+	SwitchToFiber(S->main);
+#endif
+}
+
 void 
 coroutine_resume(struct schedule * S, int id) {
 	assert(S->running == -1);
@@ -130,6 +159,12 @@ coroutine_resume(struct schedule * S, int id) {
 	int status = C->status;
 	switch(status) {
 	case COROUTINE_READY:
+#ifdef _MSC_VER
+		S->running = id;
+		C->status = COROUTINE_RUNNING;
+		C->ctx = CreateFiber(0, win_mainfunc, S);
+		SwitchToFiber(C->ctx);
+#else
 		getcontext(&C->ctx);
 		C->ctx.uc_stack.ss_sp = S->stack;
 		C->ctx.uc_stack.ss_size = STACK_SIZE;
@@ -139,12 +174,17 @@ coroutine_resume(struct schedule * S, int id) {
 		uintptr_t ptr = (uintptr_t)S;
 		makecontext(&C->ctx, (void (*)(void)) mainfunc, 2, (uint32_t)ptr, (uint32_t)(ptr>>32));
 		swapcontext(&S->main, &C->ctx);
+#endif // _MSC_VER
 		break;
 	case COROUTINE_SUSPEND:
 		memcpy(S->stack + STACK_SIZE - C->size, C->stack, C->size);
 		S->running = id;
 		C->status = COROUTINE_RUNNING;
+#ifdef _MSC_VER
+		SwitchToFiber(C->ctx);
+#else
 		swapcontext(&S->main, &C->ctx);
+#endif
 		break;
 	default:
 		assert(0);
@@ -153,6 +193,9 @@ coroutine_resume(struct schedule * S, int id) {
 
 static void
 _save_stack(struct coroutine *C, char *top) {
+#ifdef _MSC_VER
+	// nothing
+#else
 	char dummy = 0;
 	assert(top - &dummy <= STACK_SIZE);
 	if (C->cap < top - &dummy) {
@@ -162,6 +205,7 @@ _save_stack(struct coroutine *C, char *top) {
 	}
 	C->size = top - &dummy;
 	memcpy(C->stack, &dummy, C->size);
+#endif // _MSC_VER
 }
 
 void
@@ -173,7 +217,11 @@ coroutine_yield(struct schedule * S) {
 	_save_stack(C,S->stack + STACK_SIZE);
 	C->status = COROUTINE_SUSPEND;
 	S->running = -1;
-	swapcontext(&C->ctx , &S->main);
+#ifdef _MSC_VER
+	SwitchToFiber(S->main);
+#else
+	swapcontext(&C->ctx, &S->main);
+#endif
 }
 
 int 
